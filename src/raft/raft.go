@@ -82,8 +82,7 @@ type Raft struct {
 	// logs        []LogEntry
 
 	// extra
-	leader int
-	state  int // 0 follower, 1 candidate, 2 leader
+	state int // 0 follower, 1 candidate, 2 leader
 
 	heartbeatCh        chan bool
 	electionCh         chan bool
@@ -216,7 +215,6 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	if args.Term > rf.currentTerm {
 		rf.currentTerm = args.Term
 		rf.voteFor = -1
-		rf.leader = -1
 		rf.state = FOLLOWER
 	}
 
@@ -246,7 +244,6 @@ func (rf *Raft) AppendEntry(args *AppendEntryArgs, reply *AppendEntryReply) {
 	// other leader wins
 	if (args.Term > rf.currentTerm || logsAreUpdated()) && rf.state != FOLLOWER {
 		rf.currentTerm = args.Term
-		rf.leader = -1
 		rf.voteFor = -1
 		rf.state = FOLLOWER
 	}
@@ -314,6 +311,9 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 	isLeader := true
 
 	// Your code here (2B).
+	if term, isLeader = rf.GetState(); isLeader == true {
+
+	}
 
 	return index, term, isLeader
 }
@@ -396,7 +396,6 @@ func (rf *Raft) startElection() {
 	rf.startElectionEtime = time.Now()
 	Debug(dClient, "S%d starts to join election", rf.me)
 
-	rf.leader = -1
 	rf.currentTerm = rf.currentTerm + 1
 	rf.state = CANDIDATE
 	rf.voteFor = rf.me
@@ -430,7 +429,6 @@ func (rf *Raft) startElection() {
 			if reply.VoteGranted && reply.Term == rf.currentTerm && args.Term == rf.currentTerm {
 				votes++
 				if votes > len(rf.peers)/2 {
-					rf.leader = rf.me
 					rf.state = LEADER
 
 					Debug(dCommit, "S%d becomes the leader, and starts heatbeats", rf.me)
