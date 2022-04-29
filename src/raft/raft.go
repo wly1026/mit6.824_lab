@@ -77,22 +77,31 @@ type Raft struct {
 	// state a Raft server must maintain.
 
 	// persist state
-	currentTerm int
-	voteFor     int
-	// logs        []LogEntry
+	currentTerm int // 2A
+	voteFor     int // 2A
+	logs        []LogEntry
+
+	// volatile state on all servers
+	commitIndex int
+	lastApplied int
+
+	// volatile state on leaderes
+	nextIndex  []int
+	matchIndex []int
 
 	// extra
-	state int // 0 follower, 1 candidate, 2 leader
-
-	heartbeatCh        chan bool
-	electionCh         chan bool
-	startElectionEtime time.Time
+	state              int           // 2A: 0 follower, 1 candidate, 2 leader
+	heartbeatCh        chan bool     // 2A
+	electionCh         chan bool     // 2A
+	startElectionEtime time.Time     // 2A
+	applyCh            chan ApplyMsg // 2B
 }
 
-// type LogEntry struct {
-// 	commant int
-// 	term    int
-// }
+// why capitalize
+type LogEntry struct {
+	Command interface{}
+	Term    int
+}
 
 // return currentTerm and whether this server
 // believes it is the leader.
@@ -172,8 +181,11 @@ func (rf *Raft) Snapshot(index int, snapshot []byte) {
 //
 type RequestVoteArgs struct {
 	// Your data here (2A, 2B).
-	Term        int
-	CandidateId int
+	Term        int // 2A
+	CandidateId int // 2A
+
+	LastLogIndex int
+	LastLogTerm  int
 }
 
 //
@@ -187,8 +199,13 @@ type RequestVoteReply struct {
 }
 
 type AppendEntryArgs struct {
-	Term     int
-	LeaderId int
+	Term     int // 2A
+	LeaderId int // 2A
+
+	PrevLogIndex int
+	PrevLogTerm  int
+	Entries      []LogEntry
+	LeaderCommit int
 }
 
 type AppendEntryReply struct {
@@ -204,14 +221,15 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
 
-	// this request has been out of date
+	// rule1. this request has been out of date
 	if args.Term < rf.currentTerm {
+		Debug(dElect, "S%d|T%d rejects to vote for S%d | out of date term[RequestVote]", rf.me, rf.currentTerm, args.CandidateId)
 		reply.Term = rf.currentTerm
 		reply.VoteGranted = false
 		return
 	}
 
-	// current term is old, reset it. make args.Term <= rf.currentTerm
+	// current term is old, reset it. make args.Term == rf.currentTerm
 	if args.Term > rf.currentTerm {
 		rf.currentTerm = args.Term
 		rf.voteFor = -1
@@ -219,13 +237,19 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	}
 
 	reply.Term = rf.currentTerm
-	if args.Term == rf.currentTerm && (rf.voteFor == -1 || rf.voteFor == args.CandidateId) {
+
+	// rule 2:  If votedFor is null or candidateId, and candidate’s log is at least as up-to-date as receiver’s log, grant vote
+	lastLogIndex := len(rf.logs) - 1
+	if (rf.voteFor == -1 || rf.voteFor == args.CandidateId) &&
+		(args.LastLogTerm > rf.logs[lastLogIndex].Term ||
+			(args.LastLogTerm == rf.logs[lastLogIndex].Term && args.LastLogIndex >= lastLogIndex)) {
 		reply.VoteGranted = true
 		rf.voteFor = args.CandidateId
-
+		Debug(dElect, "S%d|T%d votes for S%d[RequestVote]", rf.me, rf.currentTerm, args.CandidateId)
 		// only reset when vote for the request
 		rf.startElectionEtime = time.Now()
 	} else {
+		Debug(dElect, "S%d rejects to vote for S%d because it has voted or it is more up-dated[RequestVote]", rf.me, args.CandidateId)
 		reply.VoteGranted = false
 	}
 
@@ -235,21 +259,79 @@ func (rf *Raft) AppendEntry(args *AppendEntryArgs, reply *AppendEntryReply) {
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
 
+	// rule1: Reply false if term < currentTerm
 	if args.Term < rf.currentTerm {
+		Debug(dLog, "S%d|T%d rejects to append entries from S%d | out of date term[AppendEntry]", rf.me, rf.currentTerm, args.LeaderId)
 		reply.Term = rf.currentTerm
 		reply.Success = false
 		return
 	}
 
-	// other leader wins
-	if (args.Term > rf.currentTerm || logsAreUpdated()) && rf.state != FOLLOWER {
-		rf.currentTerm = args.Term
-		rf.voteFor = -1
-		rf.state = FOLLOWER
-	}
 	rf.startElectionEtime = time.Now()
+
+	// must: args.Term >= rf.currentTerm
+	// >: means currentTerm is out of date
+	// == meaning that other leader wins in the current term
+	if args.Term > rf.currentTerm {
+		rf.currentTerm = args.Term
+		rf.state = FOLLOWER
+		// rf.voteFor = -1
+	} else if rf.state != FOLLOWER {
+		rf.state = FOLLOWER
+		// rf.voteFor = -1
+	}
+
+	// rule2: Reply false if log doesn’t contain an entry at prevLogIndex whose term matches prevLogTerm
+	if args.PrevLogIndex >= len(rf.logs) || rf.logs[args.PrevLogIndex].Term != args.PrevLogTerm {
+		Debug(dLog, "S%d|T%d rejects to append entries from S%d | inconsistency log[AppendEntry]", rf.me, rf.currentTerm, args.LeaderId)
+		reply.Term = rf.currentTerm
+		reply.Success = false
+		return
+	}
+	// rule3:If an existing entry conflicts with a new one (same index but different terms), delete the existing entry and all that follow it
+	// rule4:Append any new entries not already in the log
+	// In this case, rf.logs[args.PrevLogIndex].Term == args.PrevLogTerm
+	i, j := 0, args.PrevLogIndex+1 // i, j are the first index that are not match or out of bound
+	for ; j < len(rf.logs) && i < len(args.Entries); i, j = i+1, j+1 {
+		if args.Entries[i].Term != rf.logs[j].Term {
+			break
+		}
+	}
+
+	rf.logs = append(rf.logs[:j], args.Entries[i:]...)
 	reply.Term = rf.currentTerm
 	reply.Success = true
+	Debug(dLog, "S%d|T%d appends logs from S%d| logLen: %d[AppendEntry]", rf.me, rf.currentTerm, args.LeaderId, len(rf.logs))
+	// rule5: If leaderCommit > commitIndex, set commitIndex = min(leaderCommit, index of last new entry)
+	// ?? why args.LeaderCommit is smaller than len(rf.logs) - 1
+	if args.LeaderCommit > rf.commitIndex {
+		rf.commitIndex = min(args.LeaderCommit, len(rf.logs)-1)
+		// applyEntries
+		go rf.applyEntries()
+	}
+}
+
+func min(a, b int) int {
+	if a < b {
+		return a
+	}
+	return b
+}
+
+func (rf *Raft) applyEntries() {
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+
+	for i := rf.lastApplied + 1; i <= rf.commitIndex; i++ {
+		applyMsg := ApplyMsg{
+			CommandValid: true,
+			Command:      rf.logs[i].Command,
+			CommandIndex: i,
+		}
+		rf.applyCh <- applyMsg
+	}
+	Debug(dCommit, "S%d|T%d apply entries [%d:%d][ApplyEntry]", rf.me, rf.currentTerm, rf.lastApplied+1, rf.commitIndex)
+	rf.lastApplied = rf.commitIndex // ?? add rf.lastApplied step by step or at the end
 }
 
 //
@@ -311,8 +393,14 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 	isLeader := true
 
 	// Your code here (2B).
-	if term, isLeader = rf.GetState(); isLeader == true {
+	if term, isLeader = rf.GetState(); isLeader {
+		rf.mu.Lock()
+		defer rf.mu.Unlock()
+		rf.logs = append(rf.logs, LogEntry{command, term})
+		index = len(rf.logs) - 1
 
+		Debug(dLog, "S%d|T%d receive commands | logLen: %d[Start]",
+			rf.me, rf.currentTerm, len(rf.logs))
 	}
 
 	return index, term, isLeader
@@ -368,15 +456,10 @@ func (rf *Raft) electionRunoutTimer() {
 
 func (rf *Raft) broadcastHeartbeat() {
 	rf.mu.Lock()
-
 	if rf.state != LEADER {
+		Debug(dLog, "S%d|T%d is not leader[broadcast]", rf.me, rf.currentTerm)
 		rf.mu.Unlock()
 		return
-	}
-
-	args := &AppendEntryArgs{
-		Term:     rf.currentTerm,
-		LeaderId: rf.me,
 	}
 	rf.mu.Unlock()
 
@@ -384,27 +467,93 @@ func (rf *Raft) broadcastHeartbeat() {
 		if i == rf.me {
 			continue
 		}
-		reply := &AppendEntryReply{}
+
 		go func(peerId int) {
-			rf.sendAppendEntry(peerId, args, reply)
+		retry:
+
+			rf.mu.Lock()
+			if rf.state != LEADER {
+				Debug(dLog, "S%d|T%d lost leadership, state: %d[broadcast]", rf.me, rf.currentTerm, rf.state)
+				rf.mu.Unlock()
+				return
+			}
+			args := &AppendEntryArgs{
+				Term:         rf.currentTerm,
+				LeaderId:     rf.me,
+				PrevLogIndex: rf.nextIndex[peerId] - 1,
+				PrevLogTerm:  rf.logs[rf.nextIndex[peerId]-1].Term,
+				Entries:      rf.logs[rf.nextIndex[peerId]:],
+				LeaderCommit: rf.commitIndex,
+			}
+			rf.mu.Unlock()
+
+			reply := &AppendEntryReply{}
+			if rf.sendAppendEntry(peerId, args, reply) {
+				rf.mu.Lock()
+
+				if rf.state != LEADER {
+					Debug(dLog, "S%d|T%d lost leadership, state: %d[broadcast]", rf.me, rf.currentTerm, rf.state)
+					rf.mu.Unlock()
+					return
+				}
+
+				if rf.currentTerm != args.Term {
+					Debug(dLog, "S%d|T%d term inconsistency[broadcast]", rf.me, rf.currentTerm)
+					rf.mu.Unlock()
+					return
+				}
+
+				if reply.Success {
+					rf.matchIndex[peerId] = args.PrevLogIndex + len(args.Entries)
+					rf.nextIndex[peerId] = rf.matchIndex[peerId] + 1
+					Debug(dLog, "S%d|T%d replica entries to S%d| entrylen:%d| matchidx:%d| nextidx:%d [broadcast]", rf.me, rf.currentTerm, peerId, len(args.Entries), rf.matchIndex[peerId], rf.nextIndex[peerId])
+
+					// check if should commit
+					go rf.checkCommit()
+				} else {
+					if reply.Term > args.Term {
+						rf.currentTerm = reply.Term
+						rf.state = FOLLOWER
+						rf.voteFor = -1
+						rf.mu.Unlock()
+						return
+					}
+					// log inconsistency
+					rf.nextIndex[peerId]--
+					rf.mu.Unlock()
+					goto retry
+				}
+				rf.mu.Unlock()
+			}
 		}(i)
+	}
+}
+
+func (rf *Raft) checkCommit() {
+	lastLogIndex := len(rf.logs) - 1
+	for i := lastLogIndex; i > rf.commitIndex && rf.logs[i].Term == rf.currentTerm; i-- {
+		cnts := 1 // count leader self
+		for j := 0; j < len(rf.peers); j++ {
+			if rf.matchIndex[j] >= i {
+				cnts++
+				if cnts > len(rf.peers)/2 {
+					Debug(dCommit, "S%d|T%d update commitIndex as %d[checkCommit]", rf.me, rf.currentTerm, i)
+					rf.commitIndex = i
+					go rf.applyEntries()
+					return // ??? break
+				}
+			}
+		}
 	}
 }
 
 func (rf *Raft) startElection() {
 	rf.mu.Lock()
 	rf.startElectionEtime = time.Now()
-	Debug(dClient, "S%d starts to join election", rf.me)
-
 	rf.currentTerm = rf.currentTerm + 1
+	Debug(dElect, "S%d|T%d starts to join election", rf.me, rf.currentTerm)
 	rf.state = CANDIDATE
 	rf.voteFor = rf.me
-
-	args := &RequestVoteArgs{
-		Term:        rf.currentTerm,
-		CandidateId: rf.me,
-	}
-
 	rf.mu.Unlock()
 
 	votes := 1
@@ -413,51 +562,51 @@ func (rf *Raft) startElection() {
 		if i == rf.me {
 			continue
 		}
+		rf.mu.Lock()
+		args := &RequestVoteArgs{
+			Term:         rf.currentTerm,
+			CandidateId:  rf.me,
+			LastLogIndex: len(rf.logs) - 1,
+			LastLogTerm:  rf.logs[len(rf.logs)-1].Term,
+		}
+		rf.mu.Unlock()
+
 		reply := &RequestVoteReply{}
 		go func(peerId int) {
-			rf.sendRequestVote(peerId, args, reply)
+			if rf.sendRequestVote(peerId, args, reply) {
+				rf.mu.Lock()
+				defer rf.mu.Unlock()
 
-			rf.mu.Lock()
-			defer rf.mu.Unlock()
-
-			// receives new leader's AppendEntries RPC, and becomes follower
-			if rf.state != CANDIDATE {
-				return
-			}
-
-			// ?? term check necessary?
-			if reply.VoteGranted && reply.Term == rf.currentTerm && args.Term == rf.currentTerm {
-				votes++
-				if votes > len(rf.peers)/2 {
-					rf.state = LEADER
-
-					Debug(dCommit, "S%d becomes the leader, and starts heatbeats", rf.me)
-					rf.mu.Unlock()
-					rf.broadcastHeartbeat()
-					rf.mu.Lock()
+				if rf.state != CANDIDATE || args.Term != rf.currentTerm {
+					Debug(dElect, "S%d|T%d ends this round", rf.me, rf.currentTerm)
 					return
 				}
-			}
 
-			// other leader may win.
-			// reject it cause the term is not the lastest
-			// if reply.Term < rf.currentTerm {
-			// 	return
-			// }
-			// become follower cause its term and logs are out of date.
-			// if reply.Term > rf.currentTerm || (reply.Term == rf.currentTerm && logsAreUpdated()) {
-			// 	rf.currentTerm = reply.Term
-			// 	rf.leader = -1
-			// 	rf.voteFor = -1
-			// 	rf.state = FOLLOWER
-			// 	return
-			// }
+				if reply.VoteGranted {
+					votes++
+					if votes > len(rf.peers)/2 {
+						rf.state = LEADER
+						for i := 0; i < len(rf.peers); i++ {
+							rf.nextIndex[i] = len(rf.logs)
+							rf.matchIndex[i] = 0 // ???
+						}
+						Debug(dElect, "S%d|T%d becomes the leader, and starts heatbeats", rf.me, rf.currentTerm)
+
+						rf.mu.Unlock()
+						rf.broadcastHeartbeat()
+						rf.mu.Lock()
+						return
+					}
+				} else {
+					// two reasons when not grant the vote. 1. out-date current 2. has voted for other candidates
+					if reply.Term > rf.currentTerm {
+						rf.state = FOLLOWER
+						rf.currentTerm = reply.Term
+					}
+				}
+			}
 		}(i)
 	}
-}
-
-func logsAreUpdated() bool {
-	return true
 }
 
 // The ticker go routine starts a new election if this peer hasn't received
@@ -496,10 +645,19 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.me = me
 
 	// Your initialization code here (2A, 2B, 2C).
+	// 2A
 	rf.currentTerm = 0
 	rf.voteFor = -1
 	rf.heartbeatCh = make(chan bool)
 	rf.electionCh = make(chan bool)
+	// 2B
+	rf.logs = append(rf.logs, LogEntry{Term: 0})
+	rf.commitIndex = 0
+	rf.lastApplied = 0
+	rf.nextIndex = make([]int, len(rf.peers))
+	rf.matchIndex = make([]int, len(rf.peers))
+	rf.applyCh = applyCh
+	Debug(dLog, "S%d|T%d is made", rf.me, rf.currentTerm)
 
 	// initialize from state persisted before a crash
 	rf.readPersist(persister.ReadRaftState())

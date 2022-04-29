@@ -36,6 +36,8 @@ func getVerbosity() int {
 type logTopic string
 
 const (
+	dElect logTopic = "ELEC"
+
 	dClient  logTopic = "CLNT"
 	dCommit  logTopic = "CMIT"
 	dDrop    logTopic = "DROP"
