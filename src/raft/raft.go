@@ -211,6 +211,9 @@ type AppendEntryArgs struct {
 type AppendEntryReply struct {
 	Term    int
 	Success bool
+
+	ConflictIndex int
+	ConflictTerm  int
 }
 
 //
@@ -275,18 +278,33 @@ func (rf *Raft) AppendEntry(args *AppendEntryArgs, reply *AppendEntryReply) {
 	if args.Term > rf.currentTerm {
 		rf.currentTerm = args.Term
 		rf.state = FOLLOWER
-		// rf.voteFor = -1
 	} else if rf.state != FOLLOWER {
 		rf.state = FOLLOWER
-		// rf.voteFor = -1
 	}
 
 	// rule2: Reply false if log doesn’t contain an entry at prevLogIndex whose term matches prevLogTerm
-	if args.PrevLogIndex >= len(rf.logs) || rf.logs[args.PrevLogIndex].Term != args.PrevLogTerm {
-		Debug(dLog, "S%d|T%d rejects to append entries from S%d | inconsistency log[AppendEntry]", rf.me, rf.currentTerm, args.LeaderId)
-		reply.Term = rf.currentTerm
+	// case1: rf.logs is short. case2: not match
+	reply.Term = rf.currentTerm
+	// case1
+	if args.PrevLogIndex >= len(rf.logs) {
+		Debug(dLog, "S%d|T%d rejects to append entries from S%d | short log[AppendEntry]", rf.me, rf.currentTerm, args.LeaderId)
 		reply.Success = false
+		reply.ConflictIndex = len(rf.logs)
+		reply.ConflictTerm = -1
 		return
+	}
+
+	// case2
+	if rf.logs[args.PrevLogIndex].Term != args.PrevLogTerm {
+		Debug(dLog, "S%d|T%d rejects to append entries from S%d | inconsistency log[AppendEntry]", rf.me, rf.currentTerm, args.LeaderId)
+		reply.Success = false
+		reply.ConflictTerm = rf.logs[args.PrevLogIndex].Term
+		for i := args.PrevLogIndex; i >= 0; i-- {
+			if rf.logs[i].Term != reply.ConflictTerm {
+				break
+			}
+			reply.ConflictIndex = i
+		}
 	}
 	// rule3:If an existing entry conflicts with a new one (same index but different terms), delete the existing entry and all that follow it
 	// rule4:Append any new entries not already in the log
@@ -429,7 +447,7 @@ func (rf *Raft) killed() bool {
 
 func (rf *Raft) heartbeatTimer() {
 	for !rf.killed() {
-		time.Sleep((time.Duration(rand.Intn(300))) * time.Millisecond)
+		time.Sleep((time.Duration(HEARTBEATINTERVAL)) * time.Millisecond)
 		rf.heartbeatCh <- true
 	}
 }
@@ -518,8 +536,26 @@ func (rf *Raft) broadcastHeartbeat() {
 						rf.mu.Unlock()
 						return
 					}
+
 					// log inconsistency
-					rf.nextIndex[peerId]--
+					if reply.ConflictTerm < 0 {
+						// servers'log is short
+						rf.nextIndex[peerId] = reply.ConflictIndex
+					} else {
+						i := reply.ConflictIndex
+						for ; i >= 0; i-- {
+							if rf.logs[i].Term == reply.ConflictTerm {
+								break
+							}
+						}
+
+						if i < 0 {
+							// not found the term
+							rf.nextIndex[peerId] = reply.ConflictIndex
+						} else {
+							rf.nextIndex[peerId] = i
+						}
+					}
 					rf.mu.Unlock()
 					goto retry
 				}
