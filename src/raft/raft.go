@@ -18,14 +18,13 @@ package raft
 //
 
 import (
-	//	"bytes"
-
+	"bytes"
 	"math/rand"
 	"sync"
 	"sync/atomic"
 	"time"
 
-	//	"6.824/labgob"
+	"6.824/labgob"
 	"6.824/labrpc"
 )
 
@@ -124,13 +123,14 @@ func (rf *Raft) GetState() (int, bool) {
 //
 func (rf *Raft) persist() {
 	// Your code here (2C).
-	// Example:
-	// w := new(bytes.Buffer)
-	// e := labgob.NewEncoder(w)
-	// e.Encode(rf.xxx)
-	// e.Encode(rf.yyy)
-	// data := w.Bytes()
-	// rf.persister.SaveRaftState(data)
+	w := new(bytes.Buffer)
+	e := labgob.NewEncoder(w)
+	e.Encode(rf.currentTerm)
+	e.Encode(rf.voteFor)
+	e.Encode(rf.logs)
+	data := w.Bytes()
+	rf.persister.SaveRaftState(data)
+	Debug(dPersist, "S%d|T%d save persist| votedFor: %d| logsLen: %d", rf.me, rf.currentTerm, rf.voteFor, len(rf.logs))
 }
 
 //
@@ -141,18 +141,21 @@ func (rf *Raft) readPersist(data []byte) {
 		return
 	}
 	// Your code here (2C).
-	// Example:
-	// r := bytes.NewBuffer(data)
-	// d := labgob.NewDecoder(r)
-	// var xxx
-	// var yyy
-	// if d.Decode(&xxx) != nil ||
-	//    d.Decode(&yyy) != nil {
-	//   error...
-	// } else {
-	//   rf.xxx = xxx
-	//   rf.yyy = yyy
-	// }
+	r := bytes.NewBuffer(data)
+	d := labgob.NewDecoder(r)
+	var currentTerm int
+	var votedFor int
+	var logs []LogEntry
+	if d.Decode(&currentTerm) != nil ||
+		d.Decode(&votedFor) != nil ||
+		d.Decode(&logs) != nil {
+		Debug(dPersist, "S%d error[readPersisit]", rf.me)
+	} else {
+		rf.currentTerm = currentTerm
+		rf.voteFor = votedFor
+		rf.logs = logs
+		Debug(dPersist, "S%d|T%d read persist| votedFor: %d| logsLen: %d", rf.me, rf.currentTerm, rf.voteFor, len(rf.logs))
+	}
 }
 
 //
@@ -237,6 +240,7 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 		rf.currentTerm = args.Term
 		rf.voteFor = -1
 		rf.state = FOLLOWER
+		rf.persist()
 	}
 
 	reply.Term = rf.currentTerm
@@ -248,6 +252,7 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 			(args.LastLogTerm == rf.logs[lastLogIndex].Term && args.LastLogIndex >= lastLogIndex)) {
 		reply.VoteGranted = true
 		rf.voteFor = args.CandidateId
+		rf.persist()
 		Debug(dElect, "S%d|T%d votes for S%d[RequestVote]", rf.me, rf.currentTerm, args.CandidateId)
 		// only reset when vote for the request
 		rf.startElectionEtime = time.Now()
@@ -255,7 +260,6 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 		Debug(dElect, "S%d rejects to vote for S%d because it has voted or it is more up-dated[RequestVote]", rf.me, args.CandidateId)
 		reply.VoteGranted = false
 	}
-
 }
 
 func (rf *Raft) AppendEntry(args *AppendEntryArgs, reply *AppendEntryReply) {
@@ -277,6 +281,9 @@ func (rf *Raft) AppendEntry(args *AppendEntryArgs, reply *AppendEntryReply) {
 	// == meaning that other leader wins in the current term
 	if args.Term > rf.currentTerm {
 		rf.currentTerm = args.Term
+
+		rf.persist()
+
 		rf.state = FOLLOWER
 	} else if rf.state != FOLLOWER {
 		rf.state = FOLLOWER
@@ -301,11 +308,12 @@ func (rf *Raft) AppendEntry(args *AppendEntryArgs, reply *AppendEntryReply) {
 		reply.ConflictTerm = rf.logs[args.PrevLogIndex].Term
 		for i := args.PrevLogIndex; i >= 0; i-- {
 			if rf.logs[i].Term != reply.ConflictTerm {
-				break
+				return
 			}
 			reply.ConflictIndex = i
 		}
 	}
+
 	// rule3:If an existing entry conflicts with a new one (same index but different terms), delete the existing entry and all that follow it
 	// rule4:Append any new entries not already in the log
 	// In this case, rf.logs[args.PrevLogIndex].Term == args.PrevLogTerm
@@ -317,6 +325,8 @@ func (rf *Raft) AppendEntry(args *AppendEntryArgs, reply *AppendEntryReply) {
 	}
 
 	rf.logs = append(rf.logs[:j], args.Entries[i:]...)
+	rf.persist()
+
 	reply.Term = rf.currentTerm
 	reply.Success = true
 	Debug(dLog, "S%d|T%d appends logs from S%d| logLen: %d[AppendEntry]", rf.me, rf.currentTerm, args.LeaderId, len(rf.logs))
@@ -415,6 +425,7 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 		rf.mu.Lock()
 		defer rf.mu.Unlock()
 		rf.logs = append(rf.logs, LogEntry{command, term})
+		rf.persist()
 		index = len(rf.logs) - 1
 
 		Debug(dLog, "S%d|T%d receive commands | logLen: %d[Start]",
@@ -533,6 +544,7 @@ func (rf *Raft) broadcastHeartbeat() {
 						rf.currentTerm = reply.Term
 						rf.state = FOLLOWER
 						rf.voteFor = -1
+						rf.persist()
 						rf.mu.Unlock()
 						return
 					}
@@ -590,6 +602,9 @@ func (rf *Raft) startElection() {
 	Debug(dElect, "S%d|T%d starts to join election", rf.me, rf.currentTerm)
 	rf.state = CANDIDATE
 	rf.voteFor = rf.me
+
+	rf.persist()
+
 	rf.mu.Unlock()
 
 	votes := 1
@@ -638,6 +653,8 @@ func (rf *Raft) startElection() {
 					if reply.Term > rf.currentTerm {
 						rf.state = FOLLOWER
 						rf.currentTerm = reply.Term
+
+						rf.persist()
 					}
 				}
 			}
