@@ -76,7 +76,7 @@ type Raft struct {
 	// persist state
 	currentTerm int // 2A
 	voteFor     int // 2A
-	log         Log
+	log         Log // 2D
 
 	// volatile state on all servers
 	commitIndex int
@@ -103,6 +103,18 @@ type LogEntry struct {
 type Log struct {
 	Base       int
 	LogEntries []LogEntry
+}
+
+func (log *Log) size() int {
+	return log.Base + len(log.LogEntries)
+}
+
+func (log *Log) get(i int) LogEntry {
+	return log.LogEntries[i-log.Base]
+}
+
+func (log *Log) set(i int, entry LogEntry) {
+	log.LogEntries[i-log.Base] = entry
 }
 
 // return currentTerm and whether this server
@@ -136,6 +148,21 @@ func (rf *Raft) CondInstallSnapshot(lastIncludedTerm int, lastIncludedIndex int,
 // that index. Raft should now trim its log as much as possible.
 func (rf *Raft) Snapshot(index int, snapshot []byte) {
 	// Your code here (2D).
+	if index < rf.log.Base {
+		Debug(dSnap, "S%d|T%d calls Snapshot with older index than rf", rf.me, rf.currentTerm)
+		return
+	}
+
+	tempLogEntries := make([]LogEntry, 0)
+	tempLogEntries = append(tempLogEntries, LogEntry{Term: rf.log.get(index).Term})
+	for i := index + 1; i < rf.log.size(); i++ {
+		tempLogEntries = append(tempLogEntries, rf.log.get(i))
+	}
+
+	rf.log.LogEntries = tempLogEntries
+	rf.log.Base = index
+	rf.persister.SaveStateAndSnapshot(rf.convertByte(), snapshot)
+	Debug(dSnap, "S%d|T%d Snapshot until index %d| logLen: %d", rf.me, rf.currentTerm, index, rf.log.size())
 }
 
 //
@@ -161,12 +188,12 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 	if term, isLeader = rf.GetState(); isLeader {
 		rf.mu.Lock()
 		defer rf.mu.Unlock()
-		rf.logs = append(rf.logs, LogEntry{command, term})
+		rf.log.LogEntries = append(rf.log.LogEntries, LogEntry{command, term})
 		rf.persist()
-		index = len(rf.logs) - 1
+		index = rf.log.size() - 1
 
 		Debug(dLog, "S%d|T%d receive commands | logLen: %d[Start]",
-			rf.me, rf.currentTerm, len(rf.logs))
+			rf.me, rf.currentTerm, rf.log.size())
 	}
 
 	return index, term, isLeader
@@ -272,8 +299,8 @@ func Make(peers []*labrpc.ClientEnd, me int,
 
 	// 2D
 	rf.log = Log{
-		Base:       1,
-		LogEntries: []LogEntry{LogEntry{Term: 0}},
+		Base:       0,
+		LogEntries: []LogEntry{{Term: 0}},
 	}
 
 	Debug(dLog, "S%d|T%d is made", rf.me, rf.currentTerm)

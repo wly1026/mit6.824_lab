@@ -13,14 +13,18 @@ import (
 //
 func (rf *Raft) persist() {
 	// Your code here (2C).
+	rf.persister.SaveRaftState(rf.convertByte())
+	Debug(dPersist, "S%d|T%d save persist| votedFor: %d| logsLen: %d", rf.me, rf.currentTerm, rf.voteFor, rf.log.size())
+}
+
+func (rf *Raft) convertByte() []byte {
 	w := new(bytes.Buffer)
 	e := labgob.NewEncoder(w)
 	e.Encode(rf.currentTerm)
 	e.Encode(rf.voteFor)
-	e.Encode(rf.logs)
+	e.Encode(rf.log)
 	data := w.Bytes()
-	rf.persister.SaveRaftState(data)
-	Debug(dPersist, "S%d|T%d save persist| votedFor: %d| logsLen: %d", rf.me, rf.currentTerm, rf.voteFor, len(rf.logs))
+	return data
 }
 
 //
@@ -35,15 +39,15 @@ func (rf *Raft) readPersist(data []byte) {
 	d := labgob.NewDecoder(r)
 	var currentTerm int
 	var votedFor int
-	var logs []LogEntry
+	var log Log
 	if d.Decode(&currentTerm) != nil ||
 		d.Decode(&votedFor) != nil ||
-		d.Decode(&logs) != nil {
+		d.Decode(&log) != nil {
 		Debug(dPersist, "S%d error[readPersisit]", rf.me)
 	} else {
 		rf.currentTerm = currentTerm
 		rf.voteFor = votedFor
-		rf.logs = logs
-		Debug(dPersist, "S%d|T%d read persist| votedFor: %d| logsLen: %d", rf.me, rf.currentTerm, rf.voteFor, len(rf.logs))
+		rf.log = log
+		Debug(dPersist, "S%d|T%d read persist| votedFor: %d| logsLen: %d| base: %d", rf.me, rf.currentTerm, rf.voteFor, rf.log.size(), rf.log.Base)
 	}
 }

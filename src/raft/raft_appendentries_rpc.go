@@ -53,21 +53,21 @@ func (rf *Raft) AppendEntry(args *AppendEntryArgs, reply *AppendEntryReply) {
 	// case1: rf.logs is short. case2: not match
 	reply.Term = rf.currentTerm
 	// case1
-	if args.PrevLogIndex >= len(rf.logs) {
+	if args.PrevLogIndex >= rf.log.size() {
 		Debug(dLog, "S%d|T%d rejects to append entries from S%d | short log[AppendEntry]", rf.me, rf.currentTerm, args.LeaderId)
 		reply.Success = false
-		reply.ConflictIndex = len(rf.logs)
+		reply.ConflictIndex = rf.log.size()
 		reply.ConflictTerm = -1
 		return
 	}
 
 	// case2
-	if rf.logs[args.PrevLogIndex].Term != args.PrevLogTerm {
+	if rf.log.get(args.PrevLogIndex).Term != args.PrevLogTerm {
 		Debug(dLog, "S%d|T%d rejects to append entries from S%d | inconsistency log[AppendEntry]", rf.me, rf.currentTerm, args.LeaderId)
 		reply.Success = false
-		reply.ConflictTerm = rf.logs[args.PrevLogIndex].Term
+		reply.ConflictTerm = rf.log.get(args.PrevLogIndex).Term
 		for i := args.PrevLogIndex; i >= 0; i-- {
-			if rf.logs[i].Term != reply.ConflictTerm {
+			if rf.log.get(i).Term != reply.ConflictTerm {
 				return
 			}
 			reply.ConflictIndex = i
@@ -78,22 +78,22 @@ func (rf *Raft) AppendEntry(args *AppendEntryArgs, reply *AppendEntryReply) {
 	// rule4:Append any new entries not already in the log
 	// In this case, rf.logs[args.PrevLogIndex].Term == args.PrevLogTerm
 	i, j := 0, args.PrevLogIndex+1 // i, j are the first index that are not match or out of bound
-	for ; j < len(rf.logs) && i < len(args.Entries); i, j = i+1, j+1 {
-		if args.Entries[i].Term != rf.logs[j].Term {
+	for ; j < rf.log.size() && i < len(args.Entries); i, j = i+1, j+1 {
+		if args.Entries[i].Term != rf.log.get(i).Term {
 			break
 		}
 	}
 
-	rf.logs = append(rf.logs[:j], args.Entries[i:]...)
+	rf.log.LogEntries = append(rf.log.LogEntries[:j-rf.log.Base], args.Entries[i:]...)
 	rf.persist()
 
 	reply.Term = rf.currentTerm
 	reply.Success = true
-	Debug(dLog, "S%d|T%d appends logs from S%d| logLen: %d[AppendEntry]", rf.me, rf.currentTerm, args.LeaderId, len(rf.logs))
+	Debug(dLog, "S%d|T%d appends logs from S%d| logLen: %d[AppendEntry]", rf.me, rf.currentTerm, args.LeaderId, rf.log.size())
 	// rule5: If leaderCommit > commitIndex, set commitIndex = min(leaderCommit, index of last new entry)
 	// ?? why args.LeaderCommit is smaller than len(rf.logs) - 1
 	if args.LeaderCommit > rf.commitIndex {
-		rf.commitIndex = min(args.LeaderCommit, len(rf.logs)-1)
+		rf.commitIndex = min(args.LeaderCommit, rf.log.size()-1)
 		// applyEntries
 		go rf.applyEntries()
 	}
@@ -113,7 +113,7 @@ func (rf *Raft) applyEntries() {
 	for i := rf.lastApplied + 1; i <= rf.commitIndex; i++ {
 		applyMsg := ApplyMsg{
 			CommandValid: true,
-			Command:      rf.logs[i].Command,
+			Command:      rf.log.get(i).Command,
 			CommandIndex: i,
 		}
 		rf.applyCh <- applyMsg
@@ -154,8 +154,8 @@ func (rf *Raft) broadcastHeartbeat() {
 				Term:         rf.currentTerm,
 				LeaderId:     rf.me,
 				PrevLogIndex: rf.nextIndex[peerId] - 1,
-				PrevLogTerm:  rf.logs[rf.nextIndex[peerId]-1].Term,
-				Entries:      rf.logs[rf.nextIndex[peerId]:],
+				PrevLogTerm:  rf.log.get(rf.nextIndex[peerId] - 1).Term,
+				Entries:      rf.log.LogEntries[rf.nextIndex[peerId]-rf.log.Base:],
 				LeaderCommit: rf.commitIndex,
 			}
 			rf.mu.Unlock()
@@ -200,7 +200,7 @@ func (rf *Raft) broadcastHeartbeat() {
 					} else {
 						i := reply.ConflictIndex
 						for ; i >= 0; i-- {
-							if rf.logs[i].Term == reply.ConflictTerm {
+							if rf.log.get(i).Term == reply.ConflictTerm {
 								break
 							}
 						}
@@ -222,8 +222,8 @@ func (rf *Raft) broadcastHeartbeat() {
 }
 
 func (rf *Raft) checkCommit() {
-	lastLogIndex := len(rf.logs) - 1
-	for i := lastLogIndex; i > rf.commitIndex && rf.logs[i].Term == rf.currentTerm; i-- {
+	lastLogIndex := rf.log.size() - 1
+	for i := lastLogIndex; i > rf.commitIndex && rf.log.get(i).Term == rf.currentTerm; i-- {
 		cnts := 1 // count leader self
 		for j := 0; j < len(rf.peers); j++ {
 			if rf.matchIndex[j] >= i {

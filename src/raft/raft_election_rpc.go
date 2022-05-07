@@ -52,10 +52,10 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	reply.Term = rf.currentTerm
 
 	// rule 2:  If votedFor is null or candidateId, and candidate’s log is at least as up-to-date as receiver’s log, grant vote
-	lastLogIndex := len(rf.logs) - 1
+	lastLogIndex := rf.log.size() - 1
 	if (rf.voteFor == -1 || rf.voteFor == args.CandidateId) &&
-		(args.LastLogTerm > rf.logs[lastLogIndex].Term ||
-			(args.LastLogTerm == rf.logs[lastLogIndex].Term && args.LastLogIndex >= lastLogIndex)) {
+		(args.LastLogTerm > rf.log.get(lastLogIndex).Term ||
+			(args.LastLogTerm == rf.log.get(lastLogIndex).Term && args.LastLogIndex >= lastLogIndex)) {
 		reply.VoteGranted = true
 		rf.voteFor = args.CandidateId
 		rf.persist()
@@ -124,8 +124,8 @@ func (rf *Raft) startElection() {
 		args := &RequestVoteArgs{
 			Term:         rf.currentTerm,
 			CandidateId:  rf.me,
-			LastLogIndex: len(rf.logs) - 1,
-			LastLogTerm:  rf.logs[len(rf.logs)-1].Term,
+			LastLogIndex: rf.log.size() - 1,
+			LastLogTerm:  rf.log.get(rf.log.size() - 1).Term,
 		}
 		rf.mu.Unlock()
 
@@ -145,7 +145,7 @@ func (rf *Raft) startElection() {
 					if votes > len(rf.peers)/2 {
 						rf.state = LEADER
 						for i := 0; i < len(rf.peers); i++ {
-							rf.nextIndex[i] = len(rf.logs)
+							rf.nextIndex[i] = rf.log.size()
 							rf.matchIndex[i] = 0 // ???
 						}
 						Debug(dElect, "S%d|T%d becomes the leader, and starts heatbeats", rf.me, rf.currentTerm)
