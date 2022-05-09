@@ -48,6 +48,9 @@ func (rf *Raft) readPersist(data []byte) {
 		rf.currentTerm = currentTerm
 		rf.voteFor = votedFor
 		rf.log = log
+
+		rf.commitIndex = rf.log.Base
+		rf.lastApplied = rf.log.Base
 		Debug(dPersist, "S%d|T%d read persist| votedFor: %d| logsLen: %d| base: %d", rf.me, rf.currentTerm, rf.voteFor, rf.log.size(), rf.log.Base)
 	}
 }

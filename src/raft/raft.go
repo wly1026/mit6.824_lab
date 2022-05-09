@@ -132,40 +132,6 @@ func (rf *Raft) GetState() (int, bool) {
 }
 
 //
-// A service wants to switch to snapshot.  Only do so if Raft hasn't
-// have more recent info since it communicate the snapshot on applyCh.
-//
-func (rf *Raft) CondInstallSnapshot(lastIncludedTerm int, lastIncludedIndex int, snapshot []byte) bool {
-
-	// Your code here (2D).
-
-	return true
-}
-
-// the service says it has created a snapshot that has
-// all info up to and including index. this means the
-// service no longer needs the log through (and including)
-// that index. Raft should now trim its log as much as possible.
-func (rf *Raft) Snapshot(index int, snapshot []byte) {
-	// Your code here (2D).
-	if index < rf.log.Base {
-		Debug(dSnap, "S%d|T%d calls Snapshot with older index than rf", rf.me, rf.currentTerm)
-		return
-	}
-
-	tempLogEntries := make([]LogEntry, 0)
-	tempLogEntries = append(tempLogEntries, LogEntry{Term: rf.log.get(index).Term})
-	for i := index + 1; i < rf.log.size(); i++ {
-		tempLogEntries = append(tempLogEntries, rf.log.get(i))
-	}
-
-	rf.log.LogEntries = tempLogEntries
-	rf.log.Base = index
-	rf.persister.SaveStateAndSnapshot(rf.convertByte(), snapshot)
-	Debug(dSnap, "S%d|T%d Snapshot until index %d| logLen: %d", rf.me, rf.currentTerm, index, rf.log.size())
-}
-
-//
 // the service using Raft (e.g. a k/v server) wants to start
 // agreement on the next command to be appended to Raft's log. if this
 // server isn't the leader, returns false. otherwise start the

@@ -54,7 +54,7 @@ func (rf *Raft) AppendEntry(args *AppendEntryArgs, reply *AppendEntryReply) {
 	reply.Term = rf.currentTerm
 	// case1
 	if args.PrevLogIndex >= rf.log.size() {
-		Debug(dLog, "S%d|T%d rejects to append entries from S%d | short log[AppendEntry]", rf.me, rf.currentTerm, args.LeaderId)
+		Debug(dLog, "S%d|T%d rejects to append entries from S%d| short log| args.prev:%d| logLen:%d", rf.me, rf.currentTerm, args.LeaderId, args.PrevLogIndex, rf.log.size())
 		reply.Success = false
 		reply.ConflictIndex = rf.log.size()
 		reply.ConflictTerm = -1
@@ -66,7 +66,7 @@ func (rf *Raft) AppendEntry(args *AppendEntryArgs, reply *AppendEntryReply) {
 		Debug(dLog, "S%d|T%d rejects to append entries from S%d | inconsistency log[AppendEntry]", rf.me, rf.currentTerm, args.LeaderId)
 		reply.Success = false
 		reply.ConflictTerm = rf.log.get(args.PrevLogIndex).Term
-		for i := args.PrevLogIndex; i >= 0; i-- {
+		for i := args.PrevLogIndex; i >= rf.log.Base; i-- {
 			if rf.log.get(i).Term != reply.ConflictTerm {
 				return
 			}
@@ -79,7 +79,7 @@ func (rf *Raft) AppendEntry(args *AppendEntryArgs, reply *AppendEntryReply) {
 	// In this case, rf.logs[args.PrevLogIndex].Term == args.PrevLogTerm
 	i, j := 0, args.PrevLogIndex+1 // i, j are the first index that are not match or out of bound
 	for ; j < rf.log.size() && i < len(args.Entries); i, j = i+1, j+1 {
-		if args.Entries[i].Term != rf.log.get(i).Term {
+		if args.Entries[i].Term != rf.log.get(j).Term {
 			break
 		}
 	}
@@ -106,20 +106,38 @@ func min(a, b int) int {
 	return b
 }
 
+// don't hold lock while sending sth to channel
 func (rf *Raft) applyEntries() {
 	rf.mu.Lock()
-	defer rf.mu.Unlock()
+	Debug(dCommit, "S%d|T%d starts to apply entries [%d:%d][ApplyEntry]", rf.me, rf.currentTerm, rf.lastApplied+1, rf.commitIndex)
 
-	for i := rf.lastApplied + 1; i <= rf.commitIndex; i++ {
+	if rf.lastApplied >= rf.commitIndex {
+		rf.mu.Unlock()
+		return
+	}
+
+	entries := make([]LogEntry, rf.commitIndex-rf.lastApplied)
+	copy(entries, rf.log.LogEntries[rf.lastApplied-rf.log.Base+1:rf.commitIndex-rf.log.Base+1])
+	index := rf.lastApplied + 1
+	rf.mu.Unlock()
+
+	for _, entry := range entries {
 		applyMsg := ApplyMsg{
 			CommandValid: true,
-			Command:      rf.log.get(i).Command,
-			CommandIndex: i,
+			Command:      entry.Command,
+			CommandIndex: index,
 		}
 		rf.applyCh <- applyMsg
+
+		rf.mu.Lock()
+		rf.lastApplied = index // ?? add rf.lastApplied step by step or at the end
+		rf.mu.Unlock()
+		index = index + 1
 	}
-	Debug(dCommit, "S%d|T%d apply entries [%d:%d][ApplyEntry]", rf.me, rf.currentTerm, rf.lastApplied+1, rf.commitIndex)
-	rf.lastApplied = rf.commitIndex // ?? add rf.lastApplied step by step or at the end
+
+	rf.mu.Lock()
+	Debug(dCommit, "S%d|T%d finishes applying entries [%d:%d][ApplyEntry]", rf.me, rf.currentTerm, rf.lastApplied+1, rf.commitIndex)
+	rf.mu.Unlock()
 }
 
 func (rf *Raft) sendAppendEntry(server int, args *AppendEntryArgs, reply *AppendEntryReply) bool {
@@ -150,6 +168,16 @@ func (rf *Raft) broadcastHeartbeat() {
 				rf.mu.Unlock()
 				return
 			}
+
+			// 2D, send snapshot to servers
+			if rf.log.Base >= rf.nextIndex[peerId] {
+				Debug(dSnap, "S%d|T%d send rpc to S%d|base: %d| next: %d", rf.me, rf.currentTerm, peerId, rf.log.Base, rf.nextIndex[peerId])
+				go rf.sendSnapShotAndDealWithReply(peerId)
+				rf.mu.Unlock()
+				return
+			}
+
+			// 2B, send entry
 			args := &AppendEntryArgs{
 				Term:         rf.currentTerm,
 				LeaderId:     rf.me,
@@ -182,7 +210,7 @@ func (rf *Raft) broadcastHeartbeat() {
 					Debug(dLog, "S%d|T%d replica entries to S%d| entrylen:%d| matchidx:%d| nextidx:%d [broadcast]", rf.me, rf.currentTerm, peerId, len(args.Entries), rf.matchIndex[peerId], rf.nextIndex[peerId])
 
 					// check if should commit
-					go rf.checkCommit()
+					rf.checkCommit()
 				} else {
 					if reply.Term > args.Term {
 						rf.currentTerm = reply.Term
@@ -199,13 +227,13 @@ func (rf *Raft) broadcastHeartbeat() {
 						rf.nextIndex[peerId] = reply.ConflictIndex
 					} else {
 						i := reply.ConflictIndex
-						for ; i >= 0; i-- {
+						for ; i > rf.log.Base; i-- {
 							if rf.log.get(i).Term == reply.ConflictTerm {
 								break
 							}
 						}
 
-						if i < 0 {
+						if i == rf.log.Base {
 							// not found the term
 							rf.nextIndex[peerId] = reply.ConflictIndex
 						} else {
